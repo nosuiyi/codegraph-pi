@@ -256,6 +256,20 @@ export default async function (pi: ExtensionAPI) {
     });
   });
 
+  // ── Inject server instructions into system prompt ───────────
+  // The MCP initialize response includes a detailed playbook for HOW
+  // to use these tools (priority order, anti-patterns, etc.).  Without
+  // this, the agent gets the tools but not the strategy — and defaults
+  // to Read/Grep first, defeating the purpose.
+  pi.on("before_agent_start", async (event) => {
+    const instructions = client?.serverInstructions;
+    if (!instructions) return;
+
+    return {
+      systemPrompt: event.systemPrompt + "\n\n" + instructions,
+    };
+  });
+
   // ── Shutdown ─────────────────────────────────────────────────
 
   pi.on("session_shutdown", async () => {

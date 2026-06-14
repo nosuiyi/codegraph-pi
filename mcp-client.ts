@@ -65,6 +65,11 @@ export class McpClient {
   private _readyResolve: (() => void) | null = null;
   private _readyReject: ((err: Error) => void) | null = null;
 
+  /** Server instructions from the MCP initialize response.
+   *  These tell the agent HOW to use the tools (priority order,
+   *  anti-patterns, etc.) and should be injected into the system prompt. */
+  serverInstructions: string | null = null;
+
   /**
    * Start the MCP server subprocess and complete the initialization
    * handshake.  Resolves when the server is ready to handle
@@ -174,11 +179,19 @@ export class McpClient {
       protocolVersion: "2024-11-05",
       capabilities: {},
       clientInfo: { name: "pi-codegraph", version: "1.0.0" },
-    })) as { protocolVersion?: string; serverInfo?: unknown };
+    })) as {
+      protocolVersion?: string;
+      serverInfo?: unknown;
+      instructions?: string;
+    };
 
     if (!initResult || typeof initResult !== "object") {
       throw new Error("Invalid initialize response from CodeGraph MCP server");
     }
+
+    // Capture the server instructions so we can inject them into pi's
+    // system prompt — this is the "how to use these tools" playbook.
+    this.serverInstructions = initResult.instructions ?? null;
 
     // 2. initialized notification (no response expected)
     this._send({ jsonrpc: "2.0", method: "notifications/initialized" });
