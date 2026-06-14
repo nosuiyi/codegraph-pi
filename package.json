@@ -1,0 +1,14 @@
+{
+  "name": "codegraph-pi",
+  "version": "1.0.0",
+  "description": "CodeGraph code intelligence for the pi coding agent — pre-indexed knowledge graph with explore, node, search, and callers tools",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/colbymchenry/codegraph-pi"
+  },
+  "keywords": ["pi", "codegraph", "code-intelligence", "mcp", "knowledge-graph"],
+  "license": "MIT",
+  "pi": {
+    "extensions": ["./index.ts"]
+  }
+}
