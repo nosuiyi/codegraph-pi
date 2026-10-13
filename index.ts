@@ -1,32 +1,54 @@
 /**
  * CodeGraph extension for pi coding agent.
  *
- * Bridges pi's tool system to the CodeGraph MCP server (stdio JSON-RPC 2.0).
- * When a `.codegraph/` index is present in the project root, registers four
- * tools — `codegraph_explore`, `codegraph_node`, `codegraph_search`,
- * `codegraph_callers` — that proxy to `codegraph serve --mcp`.
+ * Bridges pi's tool system to the CodeGraph MCP server (stdio JSON-RPC 2.0)
+ * and injects CodeGraph's server instructions into pi's system prompt — the
+ * "how to use this tool" playbook that pi's built-in MCP client cannot inject
+ * in full.
+ *
+ * Tools are registered from the server's own `tools/list` response instead of
+ * being hard-coded, so the extension always matches the installed CodeGraph
+ * version:
+ *
+ *   - CodeGraph 1.0.x  → codegraph_search / callers / node / explore
+ *   - CodeGraph 1.1.5+ → codegraph_explore alone (others via CODEGRAPH_MCP_TOOLS)
+ *   - No `.codegraph/` index (1.0.x) → no tools at all; nothing is injected
+ *   - No `.codegraph/` index (1.6+)  → tools + the per-project playbook
  *
  * Installation:
  *   Copy this file + mcp-client.ts into ~/.pi/agent/extensions/codegraph/
  *
  * Upgrade safety:
  *   `codegraph upgrade` replaces the global binary; the next pi restart
- *   spawns the new version.  No extension changes needed.
+ *   spawns the new version and picks up whatever tools it lists.  No
+ *   extension changes needed.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { existsSync } from "fs";
-import { join } from "path";
-import { McpClient } from "./mcp-client";
+import { existsSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { McpClient, normalizeProjectPath, type McpTool } from "./mcp-client";
 
-// ── Shared parameter descriptions ──────────────────────────────────
+// ── Index detection ────────────────────────────────────────────────
 
-const PROJECT_PATH_DESC =
-  "Path to a different project with .codegraph/ initialized. " +
-  "If omitted, uses the current project directory.";
+/**
+ * CodeGraph answers a project's queries from the nearest `.codegraph/` at or
+ * above the session directory. Mirror that lookup so pi can say up front when
+ * the current project has no index — otherwise a forgotten `codegraph init`
+ * just silently falls back to plain file reads.
+ */
+function findIndexRoot(startDir: string): string | null {
+  let dir = resolve(startDir);
+  for (;;) {
+    if (existsSync(join(dir, ".codegraph", "codegraph.db"))) return dir;
+    const parent = dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
+}
 
-// ── Tool call helper ───────────────────────────────────────────────
+// ── MCP tool call helper ───────────────────────────────────────────
 
 type ToolContent = Array<{ type: "text"; text: string }>;
 
@@ -34,6 +56,7 @@ async function callMcpTool(
   client: McpClient | null,
   toolName: string,
   params: Record<string, unknown>,
+  signal?: AbortSignal,
 ): Promise<{ content: ToolContent; details: Record<string, unknown> }> {
   if (!client) {
     return {
@@ -43,10 +66,11 @@ async function callMcpTool(
   }
 
   try {
-    const result = (await client.call("tools/call", {
-      name: toolName,
-      arguments: params,
-    })) as { content: ToolContent; isError?: boolean };
+    const result = (await client.call(
+      "tools/call",
+      { name: toolName, arguments: params },
+      signal,
+    )) as { content: ToolContent; isError?: boolean };
 
     return { content: result.content, details: {} };
   } catch (e: unknown) {
@@ -58,25 +82,35 @@ async function callMcpTool(
   }
 }
 
+/** "codegraph_explore" → "CodeGraph Explore" */
+function toolLabel(name: string): string {
+  const words = name
+    .replace(/^codegraph[_\s-]*/i, "")
+    .split(/[_\s-]+/)
+    .filter(Boolean)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1));
+  const titled = words.join(" ") || name;
+  return /^codegraph/i.test(name) ? `CodeGraph ${titled}` : titled;
+}
+
 // ── Entry point ────────────────────────────────────────────────────
 
 export default async function (pi: ExtensionAPI) {
   let client: McpClient | null = null;
 
-  // ── Startup ──────────────────────────────────────────────────
+  // ── Startup: connect, then register whatever tools the server lists ──
 
   pi.on("session_start", async (_event, ctx) => {
-    const dbPath = join(process.cwd(), ".codegraph", "codegraph.db");
-
-    if (!existsSync(dbPath)) {
-      // No index → no tools.  Matches CodeGraph's own inactive-state
-      // design: an empty tool list is the clearest signal to the agent.
-      return;
+    // Nudge when this project has no index yet: the tools still load, but they
+    // can only tell the model "no project is loaded" — a one-line hint here
+    // saves a round-trip and reminds you to run `codegraph init`.
+    if (!findIndexRoot(ctx.cwd)) {
+      ctx.ui.setStatus("codegraph", "CodeGraph: 本项目未建索引 (codegraph init)");
     }
 
     try {
       client = new McpClient();
-      await client.start();
+      await client.start(ctx.cwd);
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : String(e);
       ctx.ui.notify(`CodeGraph: ${message}`, "warning");
@@ -85,192 +119,70 @@ export default async function (pi: ExtensionAPI) {
       return;
     }
 
-    // ── Register tools ─────────────────────────────────────────
+    let tools: McpTool[];
+    try {
+      tools = await client.listTools();
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e);
+      ctx.ui.notify(`CodeGraph: ${message}`, "warning");
+      client.dispose();
+      client = null;
+      return;
+    }
 
-    pi.registerTool({
-      name: "codegraph_explore",
-      label: "CodeGraph Explore",
-      description: [
-        "PRIMARY TOOL — call FIRST for almost any question OR before an edit:",
-        "how does X work, architecture, a bug, where/what is X, surveying an area,",
-        "or the symbols you are about to change.  Returns the verbatim source of",
-        "the relevant symbols grouped by file in ONE capped call (Read-equivalent —",
-        "treat the shown source as already Read; do NOT re-open those files), plus",
-        "the call path among them.  Query can be a natural-language question OR a",
-        "bag of symbol/file names.  Usually the ONLY call you need.",
-      ].join(" "),
-      parameters: Type.Object({
-        query: Type.String({
-          description: [
-            'Symbol names, file names, or short code terms to explore',
-            '(e.g., "AuthService loginUser session-manager",',
-            '"GraphTraverser BFS impact traversal.ts").  For a flow',
-            "question, name the symbols spanning the flow",
-            '(e.g. "mutateElement renderScene").  A natural-language',
-            "question works too.",
-          ].join(" "),
-        }),
-        maxFiles: Type.Optional(
-          Type.Number({
-            description:
-              "Maximum number of files to include source code from (default: 12).",
-          }),
-        ),
-        projectPath: Type.Optional(
-          Type.String({ description: PROJECT_PATH_DESC }),
-        ),
-      }),
-      async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-        return callMcpTool(client!, "codegraph_explore", params as Record<string, unknown>);
-      },
-    });
+    // CodeGraph 1.0.x lists no tools when the workspace has no `.codegraph/`
+    // index.  In that case keep the workspace quiet: no tools, no instructions.
+    // CodeGraph 1.6+ always lists tools and describes `projectPath` instead.
+    if (tools.length === 0) {
+      client.dispose();
+      client = null;
+      return;
+    }
 
-    pi.registerTool({
-      name: "codegraph_node",
-      label: "CodeGraph Node",
-      description: [
-        "Two modes.  (1) READ A FILE — use INSTEAD of the Read tool: pass",
-        '"file" (a path or basename) with no "symbol" and it returns that',
-        "file's current on-disk source with line numbers, exactly the shape",
-        'Read gives you, narrowable with "offset"/"limit" just like Read —',
-        "PLUS a one-line note of which files depend on it.  Same bytes as",
-        "Read, faster (served from the index), with the blast radius",
-        "attached.  Use it whenever you would Read a source file.",
-        "(2) ONE SYMBOL you can name — its location, signature, verbatim",
-        "source (includeCode=true) and caller/callee trail in one call, so",
-        "before changing it you see what calls it and what your edit would",
-        "break.  For an AMBIGUOUS name it returns EVERY matching definition's",
-        "body in one call.  Use codegraph_explore for several related",
-        "symbols or the full flow.",
-      ].join(" "),
-      parameters: Type.Object({
-        symbol: Type.Optional(
-          Type.String({
-            description:
-              'Name of the symbol to read (symbol mode).  Omit it and pass "file" alone to read a whole file like Read.',
-          }),
+    for (const tool of tools) {
+      pi.registerTool({
+        name: tool.name,
+        label: toolLabel(tool.name),
+        description: tool.description,
+        // Pass the server's JSON Schema straight through, so future CodeGraph
+        // versions can add or change parameters without touching this file.
+        parameters: Type.Unsafe(
+          (tool.inputSchema as object | undefined) ?? {
+            type: "object",
+            properties: {},
+          },
         ),
-        includeCode: Type.Optional(
-          Type.Boolean({
-            description:
-              "Symbol mode: include the symbol's full body (default: false).",
-          }),
-        ),
-        file: Type.Optional(
-          Type.String({
-            description:
-              "A file path or basename.  Pass it ALONE (no symbol) to READ the file like the Read tool, or WITH a symbol to disambiguate an overloaded name.",
-          }),
-        ),
-        offset: Type.Optional(
-          Type.Number({
-            description:
-              "File mode: 1-based line to start reading from, exactly like Read's offset.",
-          }),
-        ),
-        limit: Type.Optional(
-          Type.Number({
-            description:
-              "File mode: maximum number of lines to return, exactly like Read's limit.",
-          }),
-        ),
-        symbolsOnly: Type.Optional(
-          Type.Boolean({
-            description:
-              "File mode: return just the file's symbol map + dependents instead of its source.",
-          }),
-        ),
-        line: Type.Optional(
-          Type.Number({
-            description:
-              "Symbol mode: disambiguate to the definition at/around this line.",
-          }),
-        ),
-        projectPath: Type.Optional(
-          Type.String({ description: PROJECT_PATH_DESC }),
-        ),
-      }),
-      async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-        return callMcpTool(client!, "codegraph_node", params as Record<string, unknown>);
-      },
-    });
-
-    pi.registerTool({
-      name: "codegraph_search",
-      label: "CodeGraph Search",
-      description:
-        "Quick symbol search by name.  Returns locations only (no code).  Use codegraph_explore instead to get the actual source / understand an area in one call.",
-      parameters: Type.Object({
-        query: Type.String({
-          description:
-            'Symbol name or partial name (e.g., "auth", "signIn", "UserService").',
-        }),
-        kind: Type.Optional(
-          Type.String({
-            description:
-              "Filter by node kind: function, method, class, interface, type, variable, route, component.",
-          }),
-        ),
-        limit: Type.Optional(
-          Type.Number({
-            description: "Maximum results (default: 10).",
-          }),
-        ),
-        projectPath: Type.Optional(
-          Type.String({ description: PROJECT_PATH_DESC }),
-        ),
-      }),
-      async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-        return callMcpTool(client!, "codegraph_search", params as Record<string, unknown>);
-      },
-    });
-
-    pi.registerTool({
-      name: "codegraph_callers",
-      label: "CodeGraph Callers",
-      description:
-        "List every call site of a function — including where it is registered as a callback.  For the full flow, use codegraph_explore.",
-      parameters: Type.Object({
-        symbol: Type.String({
-          description:
-            "Name of the function, method, or class to find callers for.",
-        }),
-        file: Type.Optional(
-          Type.String({
-            description:
-              "Narrow to the definition in this file (path or suffix) when several same-named symbols exist.",
-          }),
-        ),
-        limit: Type.Optional(
-          Type.Number({
-            description: "Maximum number of callers to return (default: 20).",
-          }),
-        ),
-        projectPath: Type.Optional(
-          Type.String({ description: PROJECT_PATH_DESC }),
-        ),
-      }),
-      async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
-        return callMcpTool(client!, "codegraph_callers", params as Record<string, unknown>);
-      },
-    });
+        annotations: tool.annotations,
+        async execute(_toolCallId, params, signal) {
+          const args = { ...(params as Record<string, unknown>) };
+          if (typeof args.projectPath === "string") {
+            args.projectPath = normalizeProjectPath(args.projectPath);
+          }
+          return callMcpTool(client, tool.name, args, signal);
+        },
+      });
+    }
   });
 
-  // ── Inject server instructions into system prompt ───────────
-  // The MCP initialize response includes a detailed playbook for HOW
-  // to use these tools (priority order, anti-patterns, etc.).  Without
-  // this, the agent gets the tools but not the strategy — and defaults
-  // to Read/Grep first, defeating the purpose.
+  // ── Inject server instructions as a system-prompt section ──────────
+  // The MCP initialize response carries a detailed playbook for HOW to use
+  // these tools (priority order, anti-patterns, etc.).  Without it the agent
+  // gets the tools but not the strategy, and defaults to Read/Grep first —
+  // defeating the purpose.  pi's built-in MCP client only surfaces the first
+  // line, so we inject the full text here.
+  //
+  // Written through `systemPromptOptions.sections` rather than by returning a
+  // whole `systemPrompt`: pi then records it as a named section and appends a
+  // transcript delta instead of replacing the prompt each run, which keeps the
+  // provider's prompt cache intact.
   pi.on("before_agent_start", async (event) => {
     const instructions = client?.serverInstructions;
     if (!instructions) return;
 
-    return {
-      systemPrompt: event.systemPrompt + "\n\n" + instructions,
-    };
+    event.systemPromptOptions.sections.codegraph = instructions;
   });
 
-  // ── Shutdown ─────────────────────────────────────────────────
+  // ── Shutdown ───────────────────────────────────────────────────────
 
   pi.on("session_shutdown", async () => {
     client?.dispose();

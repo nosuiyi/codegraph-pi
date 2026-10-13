@@ -11,8 +11,9 @@
  *   4. tools/call for each pi tool invocation
  */
 
-import { spawn, type ChildProcess } from "child_process";
+import { execFileSync, spawn, type ChildProcess } from "child_process";
 import { createInterface } from "readline";
+import { pathToFileURL } from "url";
 
 // ── Types ──────────────────────────────────────────────────────────
 
@@ -44,15 +45,88 @@ interface PendingRequest {
   timer: ReturnType<typeof setTimeout>;
 }
 
+/** A tool as reported by the server's `tools/list`. */
+export interface McpTool {
+  name: string;
+  description: string;
+  /** JSON Schema for the tool's arguments, passed through to pi. */
+  inputSchema?: unknown;
+  /** MCP tool annotations (readOnlyHint and friends). */
+  annotations?: {
+    readOnlyHint?: boolean;
+    destructiveHint?: boolean;
+    idempotentHint?: boolean;
+    openWorldHint?: boolean;
+  };
+}
+
 // ── Constants ──────────────────────────────────────────────────────
 
 const REQUEST_TIMEOUT_MS = 60_000;
 
 // ── Helpers ────────────────────────────────────────────────────────
 
-/** Find the `codegraph` binary — `.cmd` on Windows, plain on POSIX. */
-function codegraphCommand(): string {
-  return process.platform === "win32" ? "codegraph.cmd" : "codegraph";
+/** How to launch `codegraph serve --mcp`. */
+interface Launch {
+  command: string;
+  args: string[];
+  shell: boolean;
+}
+
+/**
+ * Resolve how to launch the CodeGraph CLI.
+ *
+ * POSIX spawns it directly. On Windows, npm / Scoop / pnpm install `codegraph`
+ * as a `.cmd` (or `.ps1`) shim that Node cannot execute without a shell, so ask
+ * `where.exe` for the real candidates: prefer a native `.exe`, otherwise run
+ * the `.cmd` through the shell. Falls back to the plain name when `where.exe`
+ * finds nothing, so a PATH it cannot read still has a chance.
+ */
+function resolveLaunch(cwd: string): Launch {
+  const args = ["serve", "--mcp", "--path", cwd];
+
+  if (process.platform !== "win32") {
+    return { command: "codegraph", args, shell: false };
+  }
+
+  let candidates: string[] = [];
+  try {
+    candidates = execFileSync("where.exe", ["codegraph"], {
+      encoding: "utf8",
+      windowsHide: true,
+    })
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean);
+  } catch {
+    // `where.exe` found nothing — fall through to the default.
+  }
+
+  const exe = candidates.find((p) => /\.exe$/i.test(p));
+  if (exe) return { command: exe, args, shell: false };
+
+  const cmd = candidates.find((p) => /\.(cmd|bat)$/i.test(p));
+  if (cmd) return { command: cmd, args, shell: true };
+
+  return { command: "codegraph.cmd", args, shell: true };
+}
+
+/**
+ * Accept the path spellings Windows users actually type. Git Bash reports
+ * `/c/Users/...` and WSL mounts drives at `/mnt/c/...`; CodeGraph wants a
+ * native path. Input on other platforms is returned unchanged.
+ */
+export function normalizeProjectPath(input: string): string {
+  const trimmed = input.trim();
+  if (process.platform !== "win32") return trimmed;
+
+  const wsl = trimmed.match(/^\/mnt\/([a-zA-Z])\/(.*)$/);
+  if (wsl) return `${wsl[1].toUpperCase()}:\\${wsl[2].replace(/\//g, "\\")}`;
+
+  const gitBash = trimmed.match(/^\/([a-zA-Z])\/(.*)$/);
+  if (gitBash) return `${gitBash[1].toUpperCase()}:\\${gitBash[2].replace(/\//g, "\\")}`;
+
+  return trimmed;
 }
 
 // ── Client ─────────────────────────────────────────────────────────
@@ -64,6 +138,7 @@ export class McpClient {
   private _ready: Promise<void> | null = null;
   private _readyResolve: (() => void) | null = null;
   private _readyReject: ((err: Error) => void) | null = null;
+  private _cwd: string = process.cwd();
 
   /** Server instructions from the MCP initialize response.
    *  These tell the agent HOW to use the tools (priority order,
@@ -75,14 +150,24 @@ export class McpClient {
    * handshake.  Resolves when the server is ready to handle
    * `tools/call` requests.
    */
-  async start(): Promise<void> {
-    // shell:true is required on Windows so spawn can execute .cmd files.
-    // The trade-off is that proc.kill() only kills the shell, not the
-    // tree — dispose() uses taskkill on Windows to compensate.
-    const isWin = process.platform === "win32";
-    this.proc = spawn(codegraphCommand(), ["serve", "--mcp"], {
+  async start(cwd?: string): Promise<void> {
+    this._cwd = cwd ?? process.cwd();
+
+    // Resolve the CLI (shell shim on Windows) and launch it inside the session
+    // directory: CodeGraph 1.0.x finds the project from the process cwd, and
+    // only 1.6+ reads rootUri/workspaceFolders.
+    const launch = resolveLaunch(this._cwd);
+    this.proc = spawn(launch.command, launch.args, {
       stdio: ["pipe", "pipe", "pipe"],
-      shell: isWin,
+      shell: launch.shell,
+      cwd: this._cwd,
+      windowsHide: true,
+      env: {
+        ...process.env,
+        // Name pi as the real host past the Windows shell (or any launcher),
+        // so CodeGraph's ppid watchdog shuts this server down with pi.
+        CODEGRAPH_HOST_PPID: String(process.pid),
+      },
     });
 
     this._ready = new Promise((resolve, reject) => {
@@ -175,10 +260,16 @@ export class McpClient {
 
   private async _handshake(): Promise<void> {
     // 1. initialize
+    const rootUri = pathToFileURL(this._cwd).href;
+
     const initResult = (await this.call("initialize", {
       protocolVersion: "2024-11-05",
       capabilities: {},
-      clientInfo: { name: "pi-codegraph", version: "1.0.0" },
+      clientInfo: { name: "pi-codegraph", version: "2.0.0" },
+      // CodeGraph 1.0.x indexes the process cwd; 1.6+ reads the project from
+      // rootUri / workspaceFolders.  Send both so either version works.
+      rootUri,
+      workspaceFolders: [{ uri: rootUri, name: "workspace" }],
     })) as {
       protocolVersion?: string;
       serverInfo?: unknown;
@@ -199,8 +290,15 @@ export class McpClient {
 
   /**
    * Send a JSON-RPC request and wait for the matching response.
+   *
+   * Pass the tool call's `AbortSignal` to cancel in flight: pi aborts it when
+   * the user interrupts, and CodeGraph is told so it can drop the work.
    */
-  call(method: string, params: Record<string, unknown>): Promise<unknown> {
+  call(
+    method: string,
+    params: Record<string, unknown>,
+    signal?: AbortSignal,
+  ): Promise<unknown> {
     if (!this.proc) {
       throw new Error("MCP client not started");
     }
@@ -208,12 +306,49 @@ export class McpClient {
     const id = this.nextId++;
 
     return new Promise<unknown>((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new Error(`MCP request timed out after ${REQUEST_TIMEOUT_MS}ms: ${method}`));
-      }, REQUEST_TIMEOUT_MS);
+      let finished = false;
+      let timer: ReturnType<typeof setTimeout>;
 
-      this.pending.set(id, { resolve, reject, timer });
+      const settle = (fn: () => void) => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timer);
+        this.pending.delete(id);
+        signal?.removeEventListener("abort", onAbort);
+        fn();
+      };
+
+      const onAbort = () => {
+        // Best-effort cancel so the server can drop in-flight work.
+        this._send({
+          jsonrpc: "2.0",
+          method: "notifications/cancelled",
+          params: { requestId: id, reason: "client aborted" },
+        });
+        settle(() => reject(new Error(`MCP request aborted: ${method}`)));
+      };
+
+      timer = setTimeout(
+        () =>
+          settle(() =>
+            reject(new Error(`MCP request timed out after ${REQUEST_TIMEOUT_MS}ms: ${method}`)),
+          ),
+        REQUEST_TIMEOUT_MS,
+      );
+
+      this.pending.set(id, {
+        resolve: (value) => settle(() => resolve(value)),
+        reject: (reason) => settle(() => reject(reason)),
+        timer,
+      });
+
+      if (signal) {
+        if (signal.aborted) {
+          onAbort();
+          return;
+        }
+        signal.addEventListener("abort", onAbort, { once: true });
+      }
 
       const request: JsonRpcRequest = {
         jsonrpc: "2.0",
@@ -229,13 +364,21 @@ export class McpClient {
   /**
    * List tools available from the MCP server.
    */
-  async listTools(): Promise<
-    Array<{ name: string; description: string; inputSchema: unknown }>
-  > {
-    const result = (await this.call("tools/list", {})) as {
-      tools: Array<{ name: string; description: string; inputSchema: unknown }>;
-    };
-    return result.tools ?? [];
+  async listTools(): Promise<McpTool[]> {
+    const all: McpTool[] = [];
+    let cursor: string | undefined;
+
+    do {
+      const result = (await this.call(
+        "tools/list",
+        cursor ? { cursor } : {},
+      )) as { tools?: McpTool[]; nextCursor?: string };
+
+      all.push(...(result.tools ?? []));
+      cursor = result.nextCursor;
+    } while (cursor);
+
+    return all;
   }
 
   /** Write a JSON-RPC message to stdin (fire-and-forget, no response). */
