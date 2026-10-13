@@ -8,39 +8,33 @@
 
 CodeGraph integration for the [pi coding agent](https://pi.dev).
 
-Bridges pi's tool system to a pre-indexed [CodeGraph](https://github.com/colbymchenry/codegraph) knowledge graph, so pi answers structural questions — *how does X work, what calls Y, what breaks if I change Z* — in one call instead of a grep/read loop.
+CodeGraph indexes your project into a local knowledge graph; this extension hands that graph to pi. Ask *"how does this work"* or *"what breaks if I change this"*, and pi reads the answer out of the index instead of opening files one by one.
 
-### Features
+### What it gives you
 
-- **Dynamic tools** — tools are registered from the CodeGraph server's own `tools/list` response, never hard-coded. CodeGraph 1.6+ lists `codegraph_explore`; earlier versions list `search` / `callers` / `node` / `explore`; set `CODEGRAPH_MCP_TOOLS` to expose more. `codegraph upgrade` never breaks the extension.
-- **Full server playbook** — injects CodeGraph's complete server instructions into pi's system prompt (as a named section), so the agent follows CodeGraph's own strategy: query syntax, anti-patterns, and staleness handling. pi's built-in MCP client only surfaces the first line.
-- **Missing-index hint** — if the current project has no `.codegraph/` index, pi's status bar shows a reminder, instead of silently falling back to plain file reads.
-- **Cache-friendly** — instructions are injected via `systemPromptOptions.sections`, so pi appends a transcript delta rather than replacing the whole prompt each run.
-- **Cancellation aware** — pressing Esc forwards `notifications/cancelled` to CodeGraph so in-flight work is dropped.
-- **Windows / Git Bash / WSL friendly** — resolves the `codegraph` shim through `where.exe` (npm, Scoop, pnpm) and normalizes `/c/...` and `/mnt/c/...` paths.
+- **One call returns the code.** `codegraph_explore` returns the source of the symbols you named — grouped by file, with the call paths between them and what depends on them attached.
+- **It follows your CodeGraph version.** The extension asks CodeGraph which tools it has and registers exactly those. Upgrade CodeGraph and it keeps working; there is nothing to update by hand.
+- **The agent knows how to use it.** CodeGraph ships a playbook for using it well — which tool for which question, what not to do. The extension puts the whole playbook into pi's system prompt.
+- **You are told when there is nothing to read.** If a project has no index yet, pi's status bar says so, instead of quietly falling back to file reads.
 
-### Prerequisites
+### Before you start
 
-The CodeGraph CLI must be installed, and each project must be indexed:
+Install the CodeGraph CLI once, then index each project you want to query:
 
 ```bash
-# One-time install
 npm install -g @colbymchenry/codegraph
 
-# Index a project
 cd your-project
 codegraph init
 ```
 
 ### Install
 
-As a pi package:
-
 ```bash
 pi install github:nosuiyi/codegraph-pi
 ```
 
-Or copy `index.ts` + `mcp-client.ts` into `~/.pi/agent/extensions/codegraph/`.
+Or copy `index.ts` and `mcp-client.ts` into `~/.pi/agent/extensions/codegraph/`.
 
 ### Usage
 
@@ -52,11 +46,14 @@ What calls PlanBoostSession?
 What would break if I change UserRepository?
 ```
 
-When a `.codegraph/` index is present, pi loads the CodeGraph tools. When it is not, pi works normally with its built-in tools and the status bar reminds you to run `codegraph init` — a new index is picked up live, no restart needed.
+When a project has an index, pi loads the CodeGraph tools. When it does not, pi works with its built-in tools and the status bar reminds you to run `codegraph init` — a newly created index is picked up live, no restart needed.
 
-### How it works
+### Technical notes
 
-The extension spawns `codegraph serve --mcp` as a long-lived subprocess and bridges pi's tool system to CodeGraph's MCP server over stdio JSON-RPC 2.0. Each pi tool call is proxied to the MCP server, which queries the local SQLite knowledge graph. Tool schemas come from `tools/list`; the `initialize` response's `instructions` become a system-prompt section.
+- Starts `codegraph serve --mcp` once per session and proxies each tool call over stdio JSON-RPC; tool schemas come from the server's `tools/list`.
+- Injects CodeGraph's instructions as a named prompt section, so pi appends a delta instead of replacing the prompt and the provider cache stays warm.
+- Pressing Esc cancels the running query.
+- On Windows, finds the `codegraph` command with `where.exe` (npm, Scoop, and pnpm installs all work); `/c/...` (Git Bash) and `/mnt/c/...` (WSL) paths are normalized.
 
 ### Uninstall
 
@@ -64,47 +61,43 @@ The extension spawns `codegraph serve --mcp` as a long-lived subprocess and brid
 pi remove github:nosuiyi/codegraph-pi
 ```
 
+### License
+
+MIT
+
 ---
 
 ## 中文
 
-在 [pi coding agent](https://pi.dev) 上使用 [CodeGraph](https://github.com/colbymchenry/codegraph)。
+[pi coding agent](https://pi.dev) 上的 CodeGraph 集成。
 
-把 pi 的工具系统接上一张预建好的代码知识图谱，于是结构性问题——*这段代码怎么工作的、谁调用了 Y、改 Z 会影响什么*——一次调用就能回答，而不用 grep/read 一个个文件爬。
+CodeGraph 把项目索引成一张本地知识图谱，这个扩展把这张图交给 pi。当你问「这段怎么工作的」「改这里会影响什么」时，pi 从索引里直接读答案，而不是一个文件一个文件地翻。
 
-> 注意：这只是个扩展，使用前依然要安装原版 CodeGraph CLI 并给项目建索引。
+### 它给你什么
 
-### 特性
+- **一次调用就拿到代码。** `codegraph_explore` 返回你点名的那些符号的源码 —— 按文件分组，附带它们之间的调用链，以及依赖它们的东西。
+- **跟着你的 CodeGraph 版本走。** 扩展先问 CodeGraph 有哪些工具，再照着注册。升级 CodeGraph 不用改任何东西，照样能用。
+- **模型知道该怎么用它。** CodeGraph 自带一份使用说明 —— 什么问题该用哪个工具、哪些事别做。扩展把这份说明整份放进 pi 的系统提示。
+- **没东西可读时会告诉你。** 项目还没建索引时，pi 状态栏会提醒你，而不是悄悄退回普通文件读取。
 
-- **动态工具**：工具从 CodeGraph 服务端自己的 `tools/list` 响应里注册，绝不硬编码。CodeGraph 1.6+ 只列 `codegraph_explore`；更早的版本列 `search` / `callers` / `node` / `explore`；设 `CODEGRAPH_MCP_TOOLS` 可暴露更多。`codegraph upgrade` 升级后扩展不会失效。
-- **完整 playbook 注入**：把 CodeGraph 官方的完整 server instructions 作为命名 section 注入 pi 的系统提示，让模型遵循 CodeGraph 自己的策略（查询语法、反模式、索引过期处理）。pi 内置的 MCP 客户端只会取第一行。
-- **未建索引提示**：当前项目没有 `.codegraph/` 索引时，pi 状态栏会提醒一句，而不是静默退化成普通文件读取。
-- **对缓存友好**：通过 `systemPromptOptions.sections` 注入，pi 只追加 transcript delta，不做整段替换，保护 provider 的 prompt 缓存。
-- **支持取消**：按 Esc 会向 CodeGraph 发送 `notifications/cancelled`，中断正在进行的查询。
-- **兼容 Windows / Git Bash / WSL**：用 `where.exe` 解析 `codegraph` 命令（支持 npm / Scoop / pnpm 安装），并将 `/c/...`、`/mnt/c/...` 路径规范化。
+### 开始之前
 
-### 前置要求
-
-需要安装 CodeGraph CLI，并且每个项目要先建索引：
+先装一次 CodeGraph CLI，再给每个要查询的项目建索引：
 
 ```bash
-# 一次性安装
 npm install -g @colbymchenry/codegraph
 
-# 给项目建索引
 cd your-project
 codegraph init
 ```
 
 ### 安装
 
-作为 pi package 安装：
-
 ```bash
 pi install github:nosuiyi/codegraph-pi
 ```
 
-或手动把 `index.ts` + `mcp-client.ts` 复制到 `~/.pi/agent/extensions/codegraph/`。
+或把 `index.ts` 和 `mcp-client.ts` 复制到 `~/.pi/agent/extensions/codegraph/`。
 
 ### 使用
 
@@ -116,11 +109,14 @@ pi install github:nosuiyi/codegraph-pi
 改 UserRepository 会影响什么？
 ```
 
-项目有 `.codegraph/` 索引时，pi 会加载 CodeGraph 工具；没有时，pi 正常使用内置工具，同时状态栏提醒你跑 `codegraph init`——新建的索引会被运行时拾取，**无需重启 pi**。
+项目有索引时，pi 会加载 CodeGraph 工具；没有时，pi 正常使用内置工具，状态栏提醒你跑 `codegraph init` —— 新建的索引会被运行时拾取，不用重启 pi。
 
-### 工作原理
+### 技术细节
 
-扩展以长驻子进程方式启动 `codegraph serve --mcp`，在 stdio 上以 JSON-RPC 2.0 把 pi 的工具系统桥接到 CodeGraph 的 MCP server。每次 pi 工具调用都会代理到该 MCP server，由它查询本地 SQLite 知识图谱。工具 schema 来自 `tools/list`；`initialize` 响应里的 `instructions` 会变成系统提示的一个 section。
+- 每个会话启动一次 `codegraph serve --mcp`，每次工具调用通过 stdio JSON-RPC 代理；工具 schema 来自服务端的 `tools/list`。
+- CodeGraph 的使用说明以命名 section 注入，pi 只追加增量、不整段替换提示，provider 缓存不会失效。
+- 按 Esc 会取消正在进行的查询。
+- Windows 上用 `where.exe` 找 `codegraph` 命令（npm / Scoop / pnpm 都行）；`/c/...`（Git Bash）和 `/mnt/c/...`（WSL）路径会自动转换。
 
 ### 卸载
 
