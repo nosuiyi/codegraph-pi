@@ -54,6 +54,7 @@ When a project has an index, pi loads the CodeGraph tools. When it does not, pi 
 - Injects CodeGraph's instructions as a named prompt section, so pi appends a delta instead of replacing the prompt and the provider cache stays warm.
 - Pressing Esc cancels the running query.
 - On Windows, finds the `codegraph` command with `where.exe` (npm, Scoop, and pnpm installs all work); `/c/...` (Git Bash) and `/mnt/c/...` (WSL) paths are normalized.
+- Server stderr never reaches the terminal. CodeGraph's startup notices ("no default project", worker-pool lines) are buffered and only attached to the error message when the handshake or the process actually fails — writing them straight to stderr would paint over pi's input box. Set `CODEGRAPH_DEBUG=1` to echo them.
 
 ### Uninstall
 
@@ -117,6 +118,7 @@ pi install github:nosuiyi/codegraph-pi
 - CodeGraph 的使用说明以命名 section 注入，pi 只追加增量、不整段替换提示，provider 缓存不会失效。
 - 按 Esc 会取消正在进行的查询。
 - Windows 上用 `where.exe` 找 `codegraph` 命令（npm / Scoop / pnpm 都行）；`/c/...`（Git Bash）和 `/mnt/c/...`（WSL）路径会自动转换。
+- 服务端 stderr 不落终端：CodeGraph 的启动提示（「no default project」、worker 池那几行）先缓冲起来，只在握手或子进程真正失败时才附到错误信息里——直接写 stderr 会盖在 pi 的输入框上。调试时设 `CODEGRAPH_DEBUG=1` 才会原样回显。
 
 ### 卸载
 

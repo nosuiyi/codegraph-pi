@@ -64,6 +64,9 @@ export interface McpTool {
 
 const REQUEST_TIMEOUT_MS = 60_000;
 
+/** How many trailing stderr lines to keep for failure diagnostics. */
+const STDERR_TAIL_LINES = 20;
+
 // ── Helpers ────────────────────────────────────────────────────────
 
 /** How to launch `codegraph serve --mcp`. */
@@ -139,6 +142,17 @@ export class McpClient {
   private _readyResolve: (() => void) | null = null;
   private _readyReject: ((err: Error) => void) | null = null;
   private _cwd: string = process.cwd();
+  /**
+   * Recent stderr lines from the server, kept in memory for diagnostics.
+   *
+   * Never written to the terminal while the server is healthy: pi's TUI owns
+   * every screen cell, so a raw `console.error` here gets painted over the
+   * input box and only disappears on the next repaint — it reads as a glitch.
+   * CodeGraph's startup chatter ("no default project", worker-pool notices)
+   * is informational, so it stays buffered and is only surfaced when the
+   * handshake or a request actually fails. Set CODEGRAPH_DEBUG=1 to echo it.
+   */
+  private stderrTail: string[] = [];
 
   /** Server instructions from the MCP initialize response.
    *  These tell the agent HOW to use the tools (priority order,
@@ -210,18 +224,18 @@ export class McpClient {
       }
     });
 
-    // ── stderr: log for debugging ──────────────────────────────
+    // ── stderr: buffer for diagnostics, never paint the TUI ────
     this.proc.stderr?.on("data", (data: Buffer) => {
-      const text = data.toString().trim();
-      if (text) console.error("[codegraph]", text);
+      this._noteStderr(data.toString());
     });
 
     // ── exit: reject all pending requests ──────────────────────
     const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
-      const reason =
+      const reason = this._withStderrTail(
         signal != null
           ? `CodeGraph MCP server killed by signal ${signal}`
-          : `CodeGraph MCP server exited with code ${code}`;
+          : `CodeGraph MCP server exited with code ${code}`,
+      );
 
       for (const [, pending] of this.pending) {
         clearTimeout(pending.timer);
@@ -250,12 +264,34 @@ export class McpClient {
       this.proc.removeListener("error", onError);
       this.proc.kill();
       this.proc = null;
-      throw e;
+      const message = e instanceof Error ? e.message : String(e);
+      throw new Error(this._withStderrTail(message));
     }
 
     // Handshake succeeded — _ready is resolved, so null out the reject
     // guard to prevent the exit handler from crashing pi on normal shutdown.
     this._readyReject = null;
+  }
+
+  /** Append buffered stderr lines to a failure message, if there are any. */
+  private _withStderrTail(message: string): string {
+    if (this.stderrTail.length === 0) return message;
+    return `${message}\n── CodeGraph stderr (last ${this.stderrTail.length} line(s)) ──\n${this.stderrTail.join("\n")}`;
+  }
+
+  /** Buffer a chunk of server stderr; echo it only under CODEGRAPH_DEBUG. */
+  private _noteStderr(text: string): void {
+    for (const line of text.split(/\r?\n/)) {
+      const trimmed = line.trim();
+      if (trimmed) this.stderrTail.push(trimmed);
+    }
+    if (this.stderrTail.length > STDERR_TAIL_LINES) {
+      this.stderrTail.splice(0, this.stderrTail.length - STDERR_TAIL_LINES);
+    }
+    if (process.env.CODEGRAPH_DEBUG) {
+      const trimmed = text.trim();
+      if (trimmed) console.error("[codegraph]", trimmed);
+    }
   }
 
   private async _handshake(): Promise<void> {
